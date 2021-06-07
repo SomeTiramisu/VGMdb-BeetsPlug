@@ -1,8 +1,11 @@
+# update to python3
+# use lang priority everywhere
+# add prefer_original setting
+
 """Adds VGMdb search support to Beets
 """
 from beets.autotag.hooks import AlbumInfo, TrackInfo, Distance
 from beets.plugins import BeetsPlugin
-import sys
 import logging
 import requests
 import re
@@ -14,12 +17,43 @@ class VGMdbPlugin(BeetsPlugin):
     def __init__(self):
         super(VGMdbPlugin, self).__init__()
         self.config.add({
-            'source_weight': 0.0,
-            'lang-priority': 'en, ja-latn'
+            'source_weight': 1.0,
+            'lang-priority': 'en, ja-latn, ja',
+            'prefer_original': True # Only for Attack on Titan soundtracks
         })
         log.debug('Querying VGMdb')
         self.source_weight = self.config['source_weight'].as_number()
-        self.lang = self.config['lang-priority'].get().split(",")
+        self.lang = self.config['lang-priority'].get().replace(' ', '').split(",")
+        self.prefer_original = self.config['prefer_original'].get(bool)
+        
+    def lang_select(self, d):
+        """Returns the value matching lang-priority or the firt one if not found
+        """
+        if not isinstance(d, dict): return d 
+        for lang in self.lang:
+            if lang in d:
+                return d[lang]
+        return list(d.values())[0]
+    
+    def lang_select_tracks(self, d): 
+        """Same as above for tracks
+        """
+        match = {'en': ['English', 
+                        'English (from furigana)', 
+                        'English (NA localization + Additional Translations)',
+                        'English (EU localisation + Additional Translations)'], 
+             'ja-latn': ['Romaji'], 
+             'ja': ['Japanese', 'Japanese (furigana)']
+        }
+        
+        if not isinstance(d, dict): return d
+        if self.prefer_original and 'Original' in d: return d['Original']
+        for lang in self.lang:
+            if lang in match:
+                for language in match[lang]:
+                    if language in d:
+                        return d[language]
+        return list(d.values())[0]
 
     def album_distance(self, items, album_info, mapping):
         """Returns the album distance.
@@ -28,8 +62,8 @@ class VGMdbPlugin(BeetsPlugin):
         if album_info.data_source == 'VGMdb':
             dist.add('source', self.source_weight)
         return dist
-
-    def candidates(self, items, artist, album, va_likely):
+    
+    def candidates(self, items, artist, album, va_likely, extra_tags=None):
         """Returns a list of AlbumInfo objects for VGMdb search results
         matching an album and artist (if not various).
         """
@@ -38,7 +72,11 @@ class VGMdbPlugin(BeetsPlugin):
         else:
             query = '%s %s' % (artist, album)
         try:
-            return self.get_albums(query, va_likely)
+            ret = self.get_albums(query, va_likely)
+            for x in ret:
+                msg = 'Found album: %s ; id: %s ; artist: %s' % (x.album, x.album_id, x.artist)
+                log.debug(msg)
+            return ret
         except:
             log.debug('VGMdb Search Error: (query: %s)' % query)
             return []
@@ -96,38 +134,29 @@ class VGMdbPlugin(BeetsPlugin):
     def decod(self, val, codec='utf8'):
         """Ensure that all string are coded to Unicode.
         """
-        if isinstance(val, basestring):
-            return val.decode(codec, 'ignore')
+        if isinstance(val, str):
+            b = val.encode()
+            return b.decode(codec, 'ignore')
 
     def get_album_info(self, item, va_likely):
         """Convert json data into a format beets can read
         """
 
-        # If a preferred lang is available use that instead
-        album_name = item["name"]
-        for lang in self.lang:
-            if item["names"].has_key(lang):
-                album_name = item["names"][lang]
+        album_name = self.lang_select(item["names"])
+            
 
         album_id = item["link"][6:]
-        country = "JP"
+        country = None
         catalognum = item["catalog"]
 
         # Get Artist information
-        if item.has_key("performers") and len(item["performers"]) > 0:
-            artist_type = "performers"
-        else:
-            artist_type = "composers"
-
-        artists = []
-        for artist in item[artist_type]:
-            if artist["names"].has_key(self.lang[0]):
-                artists.append(artist["names"][self.lang[0]])
-            else:
-                artists.append(artist["names"]["ja"])
-
-        artist = artists[0]
-        if item[artist_type][0].has_key("link"):
+        #if "performers" in item and len(item["performers"]) > 0:
+        #    artist_type = "performers"
+        #else:
+        #    artist_type = "composers"
+        artist_type = "composers"
+        artist = self.lang_select(item[artist_type][0]["names"])
+        if "link" in item[artist_type][0]:
             artist_id = item[artist_type][0]["link"][7:]
         else:
             artist_id = None
@@ -139,12 +168,8 @@ class VGMdbPlugin(BeetsPlugin):
             for track_index, track in enumerate(disc["tracks"]):
                 total_index += 1
 
-                if track["names"].has_key("English"):
-                    title = track["names"]["English"]
-                elif track["names"].has_key("Romaji"):
-                    title = track["names"]["Romaji"]
-                else:
-                    title = track["names"].values()[0]
+                title = self.lang_select_tracks(track["names"])
+                title_alt = list(track["names"].values())
 
                 index = total_index
 
@@ -159,7 +184,8 @@ class VGMdbPlugin(BeetsPlugin):
                 medium_index = track_index
                 new_track = TrackInfo(
                     title,
-                    int(index),
+                    title_alt=title_alt,
+                    track_id=int(index),
                     length=float(length),
                     index=int(index),
                     medium=int(medium),
@@ -174,21 +200,18 @@ class VGMdbPlugin(BeetsPlugin):
         month = release_date[1]
         day   = release_date[2]
 
-        if item["publisher"]["names"].has_key(self.lang[0]):
-            label = item["publisher"]["names"][self.lang[0]]
-        else:
-            label = item["publisher"]["names"]["ja"]
+        label = self.lang_select(item["publisher"]["names"])
 
         mediums = len(item["discs"])
         media = item["media_format"]
 
         data_url = item["vgmdb_link"]
 
-        return AlbumInfo(album_name,
-                        self.decod(album_id),
-                        artist,
-                        self.decod(artist_id),
-                        Tracks,
+        return AlbumInfo(Tracks,
+                        album=album_name,
+                        album_id=self.decod(album_id),
+                        artist=artist,
+                        artist_id=self.decod(artist_id),
                         asin=None,
                         albumtype=None,
                         va=False,
